@@ -7,6 +7,10 @@
 (define-constant ERR_INVALID_STRATEGY_ID (err u1005))
 (define-constant ERR_REBALANCING_DISABLED (err u1006))
 (define-constant ERR_INSUFFICIENT_LIQUIDITY (err u1007))
+(define-constant ERR_DEPOSITS_PAUSED (err u1008))
+(define-constant ERR_WITHDRAWALS_PAUSED (err u1009))
+(define-constant ERR_REBALANCING_PAUSED (err u1010))
+(define-constant ERR_SYSTEM_PAUSED (err u1011))
 
 (define-data-var total-deposited uint u0)
 (define-data-var total-shares uint u0)
@@ -14,6 +18,11 @@
 (define-data-var rebalancing-enabled bool true)
 (define-data-var management-fee uint u100)
 (define-data-var performance-fee uint u1000)
+(define-data-var deposits-paused bool false)
+(define-data-var withdrawals-paused bool false)
+(define-data-var rebalancing-paused bool false)
+(define-data-var system-paused bool false)
+(define-data-var pause-timestamp uint u0)
 
 (define-map user-balances
     principal
@@ -116,6 +125,42 @@
     (var-get performance-fee)
 )
 
+(define-read-only (get-deposits-paused)
+    (var-get deposits-paused)
+)
+
+(define-read-only (get-withdrawals-paused)
+    (var-get withdrawals-paused)
+)
+
+(define-read-only (get-rebalancing-paused)
+    (var-get rebalancing-paused)
+)
+
+(define-read-only (get-system-paused)
+    (var-get system-paused)
+)
+
+(define-read-only (get-pause-timestamp)
+    (var-get pause-timestamp)
+)
+
+(define-read-only (is-operation-allowed (operation (string-ascii 20)))
+    (if (var-get system-paused)
+        false
+        (if (is-eq operation "deposit")
+            (not (var-get deposits-paused))
+            (if (is-eq operation "withdraw")
+                (not (var-get withdrawals-paused))
+                (if (is-eq operation "rebalance")
+                    (not (var-get rebalancing-paused))
+                    true
+                )
+            )
+        )
+    )
+)
+
 (define-public (deposit (amount uint))
     (let (
             (sender tx-sender)
@@ -124,6 +169,8 @@
             (current-shares (var-get total-shares))
         )
         (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+        (asserts! (not (var-get system-paused)) ERR_SYSTEM_PAUSED)
+        (asserts! (not (var-get deposits-paused)) ERR_DEPOSITS_PAUSED)
         (try! (stx-transfer? amount sender (as-contract tx-sender)))
         (map-set user-balances sender (+ current-balance amount))
         (var-set total-deposited (+ current-total amount))
@@ -141,6 +188,8 @@
             (current-shares (var-get total-shares))
         )
         (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+        (asserts! (not (var-get system-paused)) ERR_SYSTEM_PAUSED)
+        (asserts! (not (var-get withdrawals-paused)) ERR_WITHDRAWALS_PAUSED)
         (asserts! (>= current-balance amount) ERR_INSUFFICIENT_BALANCE)
         (asserts! (>= current-total amount) ERR_INSUFFICIENT_LIQUIDITY)
         (try! (withdraw-from-strategies amount))
@@ -199,6 +248,8 @@
 
 (define-public (rebalance-strategies)
     (let ((total-amount (var-get total-deposited)))
+        (asserts! (not (var-get system-paused)) ERR_SYSTEM_PAUSED)
+        (asserts! (not (var-get rebalancing-paused)) ERR_REBALANCING_PAUSED)
         (asserts! (var-get rebalancing-enabled) ERR_REBALANCING_DISABLED)
         (asserts! (> total-amount u0) ERR_INSUFFICIENT_LIQUIDITY)
         (try! (rebalance-strategy u1))
@@ -236,6 +287,100 @@
         (try! (as-contract (stx-transfer? fee-amount tx-sender CONTRACT_OWNER)))
         (var-set total-deposited (- total-amount fee-amount))
         (ok fee-amount)
+    )
+)
+
+(define-public (pause-deposits)
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (var-set deposits-paused true)
+        (var-set pause-timestamp stacks-block-height)
+        (ok true)
+    )
+)
+
+(define-public (unpause-deposits)
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (var-set deposits-paused false)
+        (ok true)
+    )
+)
+
+(define-public (pause-withdrawals)
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (var-set withdrawals-paused true)
+        (var-set pause-timestamp stacks-block-height)
+        (ok true)
+    )
+)
+
+(define-public (unpause-withdrawals)
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (var-set withdrawals-paused false)
+        (ok true)
+    )
+)
+
+(define-public (pause-rebalancing)
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (var-set rebalancing-paused true)
+        (var-set pause-timestamp stacks-block-height)
+        (ok true)
+    )
+)
+
+(define-public (unpause-rebalancing)
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (var-set rebalancing-paused false)
+        (ok true)
+    )
+)
+
+(define-public (emergency-pause)
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (var-set system-paused true)
+        (var-set deposits-paused true)
+        (var-set withdrawals-paused true)
+        (var-set rebalancing-paused true)
+        (var-set pause-timestamp stacks-block-height)
+        (ok true)
+    )
+)
+
+(define-public (emergency-unpause)
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (var-set system-paused false)
+        (var-set deposits-paused false)
+        (var-set withdrawals-paused false)
+        (var-set rebalancing-paused false)
+        (ok true)
+    )
+)
+
+(define-public (emergency-withdraw (amount uint))
+    (let (
+            (sender tx-sender)
+            (current-balance (get-user-balance sender))
+            (current-total (var-get total-deposited))
+            (current-shares (var-get total-shares))
+        )
+        (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+        (asserts! (>= current-balance amount) ERR_INSUFFICIENT_BALANCE)
+        (asserts! (>= current-total amount) ERR_INSUFFICIENT_LIQUIDITY)
+        (asserts! (var-get system-paused) ERR_UNAUTHORIZED)
+        (try! (withdraw-from-strategies amount))
+        (try! (as-contract (stx-transfer? amount tx-sender sender)))
+        (map-set user-balances sender (- current-balance amount))
+        (var-set total-deposited (- current-total amount))
+        (var-set total-shares (- current-shares amount))
+        (ok amount)
     )
 )
 
