@@ -11,6 +11,10 @@
 (define-constant ERR_WITHDRAWALS_PAUSED (err u1009))
 (define-constant ERR_REBALANCING_PAUSED (err u1010))
 (define-constant ERR_SYSTEM_PAUSED (err u1011))
+(define-constant ERR_INVALID_LOCK_PERIOD (err u1012))
+(define-constant ERR_FUNDS_STILL_LOCKED (err u1013))
+(define-constant ERR_NO_LOCKED_DEPOSIT (err u1014))
+(define-constant ERR_LOCK_ALREADY_EXISTS (err u1015))
 
 (define-data-var total-deposited uint u0)
 (define-data-var total-shares uint u0)
@@ -23,6 +27,8 @@
 (define-data-var rebalancing-paused bool false)
 (define-data-var system-paused bool false)
 (define-data-var pause-timestamp uint u0)
+(define-data-var total-locked-deposits uint u0)
+(define-data-var early-withdrawal-penalty uint u1000)
 
 (define-map user-balances
     principal
@@ -47,6 +53,25 @@
         user: principal,
     }
     uint
+)
+
+(define-map time-locks
+    principal
+    {
+        amount: uint,
+        lock-period: uint,
+        start-block: uint,
+        end-block: uint,
+        bonus-multiplier: uint,
+    }
+)
+
+(define-map lock-periods
+    uint
+    {
+        blocks: uint,
+        bonus-multiplier: uint,
+    }
 )
 
 (define-read-only (get-user-balance (user principal))
@@ -158,6 +183,49 @@
                 )
             )
         )
+    )
+)
+
+(define-read-only (get-user-time-lock (user principal))
+    (map-get? time-locks user)
+)
+
+(define-read-only (get-lock-period-info (period-id uint))
+    (map-get? lock-periods period-id)
+)
+
+(define-read-only (get-total-locked-deposits)
+    (var-get total-locked-deposits)
+)
+
+(define-read-only (get-early-withdrawal-penalty)
+    (var-get early-withdrawal-penalty)
+)
+
+(define-read-only (is-lock-expired (user principal))
+    (match (map-get? time-locks user)
+        lock-info (>= stacks-block-height (get end-block lock-info))
+        true
+    )
+)
+
+(define-read-only (calculate-bonus-yield
+        (user principal)
+        (base-yield uint)
+    )
+    (match (map-get? time-locks user)
+        lock-info (/ (* base-yield (get bonus-multiplier lock-info)) u10000)
+        base-yield
+    )
+)
+
+(define-read-only (get-remaining-lock-blocks (user principal))
+    (match (map-get? time-locks user)
+        lock-info (if (>= stacks-block-height (get end-block lock-info))
+            u0
+            (- (get end-block lock-info) stacks-block-height)
+        )
+        u0
     )
 )
 
@@ -384,6 +452,112 @@
     )
 )
 
+(define-public (deposit-with-time-lock
+        (amount uint)
+        (lock-period-id uint)
+    )
+    (let (
+            (sender tx-sender)
+            (current-balance (get-user-balance sender))
+            (current-total (var-get total-deposited))
+            (current-shares (var-get total-shares))
+            (period-info (unwrap! (map-get? lock-periods lock-period-id)
+                ERR_INVALID_LOCK_PERIOD
+            ))
+            (lock-blocks (get blocks period-info))
+            (bonus-multiplier (get bonus-multiplier period-info))
+            (end-block (+ stacks-block-height lock-blocks))
+        )
+        (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+        (asserts! (not (var-get system-paused)) ERR_SYSTEM_PAUSED)
+        (asserts! (not (var-get deposits-paused)) ERR_DEPOSITS_PAUSED)
+        (asserts! (is-none (map-get? time-locks sender)) ERR_LOCK_ALREADY_EXISTS)
+        (try! (stx-transfer? amount sender (as-contract tx-sender)))
+        (map-set user-balances sender (+ current-balance amount))
+        (map-set time-locks sender {
+            amount: amount,
+            lock-period: lock-period-id,
+            start-block: stacks-block-height,
+            end-block: end-block,
+            bonus-multiplier: bonus-multiplier,
+        })
+        (var-set total-deposited (+ current-total amount))
+        (var-set total-shares (+ current-shares amount))
+        (var-set total-locked-deposits (+ (var-get total-locked-deposits) amount))
+        (try! (auto-allocate-deposit amount))
+        (ok amount)
+    )
+)
+
+(define-public (withdraw-locked-deposit)
+    (let (
+            (sender tx-sender)
+            (lock-info (unwrap! (map-get? time-locks sender) ERR_NO_LOCKED_DEPOSIT))
+            (locked-amount (get amount lock-info))
+            (current-balance (get-user-balance sender))
+            (current-total (var-get total-deposited))
+            (current-shares (var-get total-shares))
+        )
+        (asserts! (not (var-get system-paused)) ERR_SYSTEM_PAUSED)
+        (asserts! (>= stacks-block-height (get end-block lock-info))
+            ERR_FUNDS_STILL_LOCKED
+        )
+        (asserts! (>= current-balance locked-amount) ERR_INSUFFICIENT_BALANCE)
+        (asserts! (>= current-total locked-amount) ERR_INSUFFICIENT_LIQUIDITY)
+        (try! (withdraw-from-strategies locked-amount))
+        (try! (as-contract (stx-transfer? locked-amount tx-sender sender)))
+        (map-delete time-locks sender)
+        (map-set user-balances sender (- current-balance locked-amount))
+        (var-set total-deposited (- current-total locked-amount))
+        (var-set total-shares (- current-shares locked-amount))
+        (var-set total-locked-deposits
+            (- (var-get total-locked-deposits) locked-amount)
+        )
+        (ok locked-amount)
+    )
+)
+
+(define-public (early-withdraw-locked-deposit)
+    (let (
+            (sender tx-sender)
+            (lock-info (unwrap! (map-get? time-locks sender) ERR_NO_LOCKED_DEPOSIT))
+            (locked-amount (get amount lock-info))
+            (penalty-rate (var-get early-withdrawal-penalty))
+            (penalty-amount (/ (* locked-amount penalty-rate) u10000))
+            (withdrawal-amount (- locked-amount penalty-amount))
+            (current-balance (get-user-balance sender))
+            (current-total (var-get total-deposited))
+            (current-shares (var-get total-shares))
+        )
+        (asserts! (not (var-get system-paused)) ERR_SYSTEM_PAUSED)
+        (asserts! (not (var-get withdrawals-paused)) ERR_WITHDRAWALS_PAUSED)
+        (asserts! (< stacks-block-height (get end-block lock-info))
+            ERR_FUNDS_STILL_LOCKED
+        )
+        (asserts! (>= current-balance locked-amount) ERR_INSUFFICIENT_BALANCE)
+        (asserts! (>= current-total withdrawal-amount) ERR_INSUFFICIENT_LIQUIDITY)
+        (try! (withdraw-from-strategies withdrawal-amount))
+        (try! (as-contract (stx-transfer? withdrawal-amount tx-sender sender)))
+        (map-delete time-locks sender)
+        (map-set user-balances sender (- current-balance locked-amount))
+        (var-set total-deposited (- current-total locked-amount))
+        (var-set total-shares (- current-shares locked-amount))
+        (var-set total-locked-deposits
+            (- (var-get total-locked-deposits) locked-amount)
+        )
+        (ok withdrawal-amount)
+    )
+)
+
+(define-public (set-early-withdrawal-penalty (penalty uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (asserts! (<= penalty u5000) ERR_INVALID_AMOUNT)
+        (var-set early-withdrawal-penalty penalty)
+        (ok true)
+    )
+)
+
 (define-private (auto-allocate-deposit (amount uint))
     (let ((best-strategy (find-best-strategy)))
         (if (is-some best-strategy)
@@ -528,6 +702,26 @@
         (ok false)
     )
 )
+
+(map-set lock-periods u1 {
+    blocks: u4320,
+    bonus-multiplier: u10500,
+})
+
+(map-set lock-periods u2 {
+    blocks: u12960,
+    bonus-multiplier: u11500,
+})
+
+(map-set lock-periods u3 {
+    blocks: u25920,
+    bonus-multiplier: u13000,
+})
+
+(map-set lock-periods u4 {
+    blocks: u52560,
+    bonus-multiplier: u15000,
+})
 
 (map-set strategies u1 {
     name: "High Yield Strategy",
