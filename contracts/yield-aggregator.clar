@@ -15,6 +15,10 @@
 (define-constant ERR_FUNDS_STILL_LOCKED (err u1013))
 (define-constant ERR_NO_LOCKED_DEPOSIT (err u1014))
 (define-constant ERR_LOCK_ALREADY_EXISTS (err u1015))
+(define-constant ERR_INVALID_REFERRER (err u1016))
+(define-constant ERR_SELF_REFERRAL (err u1017))
+(define-constant ERR_ALREADY_REFERRED (err u1018))
+(define-constant ERR_NO_REWARDS (err u1019))
 
 (define-data-var total-deposited uint u0)
 (define-data-var total-shares uint u0)
@@ -29,6 +33,9 @@
 (define-data-var pause-timestamp uint u0)
 (define-data-var total-locked-deposits uint u0)
 (define-data-var early-withdrawal-penalty uint u1000)
+(define-data-var referral-reward-rate uint u500)
+(define-data-var total-referral-rewards uint u0)
+(define-data-var referral-enabled bool true)
 
 (define-map user-balances
     principal
@@ -72,6 +79,25 @@
         blocks: uint,
         bonus-multiplier: uint,
     }
+)
+
+(define-map referrals
+    principal
+    principal
+)
+
+(define-map referral-stats
+    principal
+    {
+        total-referrals: uint,
+        total-rewards-earned: uint,
+        total-referee-volume: uint,
+    }
+)
+
+(define-map pending-rewards
+    principal
+    uint
 )
 
 (define-read-only (get-user-balance (user principal))
@@ -227,6 +253,40 @@
         )
         u0
     )
+)
+
+(define-read-only (get-referrer (user principal))
+    (map-get? referrals user)
+)
+
+(define-read-only (get-referral-stats (referrer principal))
+    (default-to {
+        total-referrals: u0,
+        total-rewards-earned: u0,
+        total-referee-volume: u0,
+    }
+        (map-get? referral-stats referrer)
+    )
+)
+
+(define-read-only (get-pending-rewards (referrer principal))
+    (default-to u0 (map-get? pending-rewards referrer))
+)
+
+(define-read-only (get-referral-reward-rate)
+    (var-get referral-reward-rate)
+)
+
+(define-read-only (get-total-referral-rewards)
+    (var-get total-referral-rewards)
+)
+
+(define-read-only (is-referral-enabled)
+    (var-get referral-enabled)
+)
+
+(define-read-only (calculate-referral-reward (deposit-amount uint))
+    (/ (* deposit-amount (var-get referral-reward-rate)) u10000)
 )
 
 (define-public (deposit (amount uint))
@@ -555,6 +615,118 @@
         (asserts! (<= penalty u5000) ERR_INVALID_AMOUNT)
         (var-set early-withdrawal-penalty penalty)
         (ok true)
+    )
+)
+
+(define-public (register-referral (referrer principal))
+    (let ((referee tx-sender))
+        (asserts! (not (is-eq referee referrer)) ERR_SELF_REFERRAL)
+        (asserts! (is-none (map-get? referrals referee)) ERR_ALREADY_REFERRED)
+        (asserts! (> (get-user-balance referrer) u0) ERR_INVALID_REFERRER)
+        (map-set referrals referee referrer)
+        (let (
+                (current-stats (get-referral-stats referrer))
+                (new-referral-count (+ (get total-referrals current-stats) u1))
+            )
+            (map-set referral-stats referrer
+                (merge current-stats { total-referrals: new-referral-count })
+            )
+        )
+        (ok true)
+    )
+)
+
+(define-public (deposit-with-referral
+        (amount uint)
+        (referrer principal)
+    )
+    (let (
+            (sender tx-sender)
+            (current-balance (get-user-balance sender))
+            (current-total (var-get total-deposited))
+            (current-shares (var-get total-shares))
+            (has-referrer (is-some (map-get? referrals sender)))
+        )
+        (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+        (asserts! (not (var-get system-paused)) ERR_SYSTEM_PAUSED)
+        (asserts! (not (var-get deposits-paused)) ERR_DEPOSITS_PAUSED)
+        (asserts! (not (is-eq sender referrer)) ERR_SELF_REFERRAL)
+        (if (not has-referrer)
+            (begin
+                (asserts! (> (get-user-balance referrer) u0) ERR_INVALID_REFERRER)
+                (try! (register-referral referrer))
+            )
+            true
+        )
+        (try! (stx-transfer? amount sender (as-contract tx-sender)))
+        (map-set user-balances sender (+ current-balance amount))
+        (var-set total-deposited (+ current-total amount))
+        (var-set total-shares (+ current-shares amount))
+        (try! (auto-allocate-deposit amount))
+        (unwrap-panic (process-referral-reward amount sender))
+        (ok amount)
+    )
+)
+
+(define-public (claim-referral-rewards)
+    (let (
+            (claimer tx-sender)
+            (pending-amount (get-pending-rewards claimer))
+        )
+        (asserts! (> pending-amount u0) ERR_NO_REWARDS)
+        (try! (as-contract (stx-transfer? pending-amount tx-sender claimer)))
+        (map-set pending-rewards claimer u0)
+        (ok pending-amount)
+    )
+)
+
+(define-public (set-referral-reward-rate (rate uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (asserts! (<= rate u2000) ERR_INVALID_AMOUNT)
+        (var-set referral-reward-rate rate)
+        (ok true)
+    )
+)
+
+(define-public (toggle-referral-system (enabled bool))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (var-set referral-enabled enabled)
+        (ok true)
+    )
+)
+
+(define-private (process-referral-reward
+        (deposit-amount uint)
+        (depositor principal)
+    )
+    (let (
+            (referrer-opt (map-get? referrals depositor))
+            (referral-active (var-get referral-enabled))
+        )
+        (if (and referral-active (is-some referrer-opt))
+            (let (
+                    (referrer (unwrap-panic referrer-opt))
+                    (reward-amount (calculate-referral-reward deposit-amount))
+                    (current-pending (get-pending-rewards referrer))
+                    (current-stats (get-referral-stats referrer))
+                )
+                (map-set pending-rewards referrer
+                    (+ current-pending reward-amount)
+                )
+                (map-set referral-stats referrer {
+                    total-referrals: (get total-referrals current-stats),
+                    total-rewards-earned: (+ (get total-rewards-earned current-stats) reward-amount),
+                    total-referee-volume: (+ (get total-referee-volume current-stats) deposit-amount),
+                })
+                (var-set total-referral-rewards
+                    (+ (var-get total-referral-rewards) reward-amount)
+                )
+                (ok true)
+            )
+            (ok true)
+        )
     )
 )
 
