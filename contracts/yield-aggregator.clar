@@ -289,6 +289,38 @@
     (/ (* deposit-amount (var-get referral-reward-rate)) u10000)
 )
 
+(define-read-only (simulate-deposit
+        (amount uint)
+        (depositor principal)
+        (referrer (optional principal))
+    )
+    (let (
+            (valid-amount (> amount u0))
+            (allowed (and (not (var-get system-paused)) (not (var-get deposits-paused))))
+            (current-balance (default-to u0 (map-get? user-balances depositor)))
+            (current-total (var-get total-deposited))
+            (current-shares (var-get total-shares))
+            (best-strategy (find-best-strategy))
+            (has-existing-referrer (is-some (map-get? referrals depositor)))
+            (referral-active (var-get referral-enabled))
+            (provided-referrer (if (is-some referrer) (unwrap-panic referrer) depositor))
+            (provided-valid (and (is-some referrer) (not (is-eq depositor provided-referrer)) (> (default-to u0 (map-get? user-balances provided-referrer)) u0)))
+            (effective-referrer (if has-existing-referrer (map-get? referrals depositor) (if provided-valid referrer none)))
+            (new-user-balance (+ current-balance amount))
+            (new-total-deposited (+ current-total amount))
+            (new-total-shares (+ current-shares amount))
+            (reward-amount (if (and referral-active (is-some effective-referrer)) (calculate-referral-reward amount) u0))
+        )
+        { allowed: allowed,
+          best-strategy: best-strategy,
+          new-user-balance: new-user-balance,
+          new-total-deposited: new-total-deposited,
+          new-total-shares: new-total-shares,
+          referral-reward: reward-amount,
+          referrer-used: effective-referrer }
+    )
+)
+
 (define-public (deposit (amount uint))
     (let (
             (sender tx-sender)
