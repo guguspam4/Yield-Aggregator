@@ -321,6 +321,40 @@
     )
 )
 
+(define-read-only (simulate-withdraw
+        (amount uint)
+        (user principal)
+    )
+    (let (
+            (valid-amount (> amount u0))
+            (allowed-base (and valid-amount (not (var-get system-paused)) (not (var-get withdrawals-paused))))
+            (current-balance (default-to u0 (map-get? user-balances user)))
+            (current-total (var-get total-deposited))
+            (current-shares (var-get total-shares))
+            (has-liquidity (and (>= current-balance amount) (>= current-total amount)))
+            (b1 (get-strategy-balance u1))
+            (w1 (min amount b1))
+            (rem1 (if (> amount w1) (- amount w1) u0))
+            (b2 (get-strategy-balance u2))
+            (w2 (min rem1 b2))
+            (rem2 (if (> rem1 w2) (- rem1 w2) u0))
+            (b3 (get-strategy-balance u3))
+            (w3 (min rem2 b3))
+            (new-user-balance (if (and allowed-base has-liquidity) (- current-balance amount) current-balance))
+            (new-total-deposited (if (and allowed-base has-liquidity) (- current-total amount) current-total))
+            (new-total-shares (if (and allowed-base has-liquidity) (- current-shares amount) current-shares))
+            (final-allowed (and allowed-base has-liquidity))
+        )
+        { allowed: final-allowed,
+          plan-u1: w1,
+          plan-u2: w2,
+          plan-u3: w3,
+          new-user-balance: new-user-balance,
+          new-total-deposited: new-total-deposited,
+          new-total-shares: new-total-shares }
+    )
+)
+
 (define-public (deposit (amount uint))
     (let (
             (sender tx-sender)
